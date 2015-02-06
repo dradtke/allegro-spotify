@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,7 @@
 
 #include <allegro5/allegro.h>
 #include <allegro5/allegro_audio.h>
+#include <allegro5/allegro_spotify.h>
 
 #define DEBUG 0 // change to 1 for debugging information
 
@@ -14,19 +16,6 @@ extern const uint8_t g_appkey[];
 extern const size_t g_appkey_size;
 extern const char *username;
 extern const char *password;
-
-// All of these events contain a pointer to the ALLEGRO_SPOTIFY_STREAM instance in the data1 field.
-
-// Represents a login event from Spotify. The data2 field contains the status of the login attempt
-// as an sp_error value; anything besides SP_ERROR_OK indicates that the login failed.
-const int32_t ALLEGRO_EVENT_SPOTIFY_LOGIN = ALLEGRO_GET_EVENT_TYPE('S', 'P', 'O', 'L'); // Spotify Login
-
-// Represents libspotify telling the main thread that it needs to process more events.
-// This can be done by calling al_spotify_stream_process_events().
-const int32_t ALLEGRO_EVENT_SPOTIFY_NOTIFY_MAIN_THREAD = ALLEGRO_GET_EVENT_TYPE('S', 'N', 'M', 'T'); // Spotify Notify Main
-
-// Represents a notification that the current track has ended.
-const int32_t ALLEGRO_EVENT_SPOTIFY_END_OF_TRACK = ALLEGRO_GET_EVENT_TYPE('S', 'E', 'O', 'T'); // Spotify End of Track
 
 // TODO: finish creating Allegro events for all of the callbacks defined at
 //          https://developer.spotify.com/docs/libspotify/12.1.51/structsp__session__callbacks.html
@@ -39,14 +28,14 @@ struct _ALLEGRO_SPOTIFY_STREAM {
 
 	bool logged_in;
 	bool playing;
+	int frames_per_fragment;
 
 	ALLEGRO_EVENT_SOURCE event_source;
 	ALLEGRO_EVENT login_event;
 	ALLEGRO_EVENT notify_event;
 	ALLEGRO_EVENT end_of_track_event;
+	ALLEGRO_EVENT search_complete_event;
 };
-
-typedef struct _ALLEGRO_SPOTIFY_STREAM ALLEGRO_SPOTIFY_STREAM;
 
 static void debug(const char *format, ...)
 {
@@ -84,8 +73,10 @@ static void _on_search_complete(sp_search *search, void *userdata)
 	}
 
 	int num_tracks = sp_search_num_tracks(search);
+	spotify_stream->search_complete_event.user.data2 = num_tracks;
+	al_emit_user_event(&spotify_stream->event_source, &spotify_stream->search_complete_event, NULL);
+
 	if (num_tracks == 0) {
-		fprintf(stderr, "Sorry, couldn't find that track. =/\n\n");
 		sp_search_release(search);
 		spotify_stream->playing = 0;
 		return;
@@ -163,15 +154,16 @@ static int _on_music_delivery(sp_session *session, const sp_audioformat *format,
 
 	ALLEGRO_SPOTIFY_STREAM *spotify_stream = (ALLEGRO_SPOTIFY_STREAM*)(sp_session_userdata(session));
 	al_lock_mutex(spotify_stream->mutex);
-	int bytes_per_fragment = num_frames * sizeof(int16_t) * format->channels;
 
 	// Lazily initialize the underlying audio stream so that it can match Spotify's numbers.
 	if (spotify_stream->stream == NULL) {
+		int bytes_per_fragment = num_frames * sizeof(int16_t) * format->channels;
 		ALLEGRO_AUDIO_STREAM *stream = _create_audio_stream(format, bytes_per_fragment);
 		if (stream == NULL) {
 			return 0;
 		}
 		spotify_stream->stream = stream;
+		spotify_stream->frames_per_fragment = num_frames;
 	}
 
 	void *buffer = al_get_audio_stream_fragment(spotify_stream->stream);
@@ -180,18 +172,21 @@ static int _on_music_delivery(sp_session *session, const sp_audioformat *format,
 		return 0;
 	}
 
-	memcpy(buffer, frames, bytes_per_fragment);
+	int frames_to_copy = fmin(num_frames, spotify_stream->frames_per_fragment);
+	int bytes_to_copy = frames_to_copy * sizeof(int16_t) * format->channels;
+
+	memcpy(buffer, frames, bytes_to_copy);
 	al_set_audio_stream_fragment(spotify_stream->stream, buffer);
 	al_unlock_mutex(spotify_stream->mutex);
 
-	return num_frames;
+	return frames_to_copy;
 }
 
 static void _on_end_of_track(sp_session *session)
 {
 	debug("track ended");
+	sp_session_player_unload(session);
 	ALLEGRO_SPOTIFY_STREAM *spotify_stream = (ALLEGRO_SPOTIFY_STREAM*)(sp_session_userdata(session));
-	// TODO: this still segfaults =/
 	al_emit_user_event(&spotify_stream->event_source, &spotify_stream->end_of_track_event, NULL);
 }
 
@@ -243,6 +238,9 @@ ALLEGRO_SPOTIFY_STREAM *al_new_spotify_stream(ALLEGRO_EVENT_QUEUE *event_queue) 
 	spotify_stream->end_of_track_event.user.type = ALLEGRO_EVENT_SPOTIFY_END_OF_TRACK;
 	spotify_stream->end_of_track_event.user.data1 = (intptr_t)(spotify_stream);
 
+	spotify_stream->search_complete_event.user.type = ALLEGRO_EVENT_SPOTIFY_SEARCH_COMPLETE;
+	spotify_stream->search_complete_event.user.data1 = (intptr_t)(spotify_stream);
+
 	al_init_user_event_source(&spotify_stream->event_source);
 	al_register_event_source(event_queue, &spotify_stream->event_source);
 
@@ -251,19 +249,19 @@ ALLEGRO_SPOTIFY_STREAM *al_new_spotify_stream(ALLEGRO_EVENT_QUEUE *event_queue) 
 	al_append_path_component(spotify_stream->cache, "allegro-spotify");
 
 	// Create and populate the session configuration.
-	sp_session_config *spconfig = (sp_session_config*)(al_malloc(sizeof(sp_session_config)));
-	memset(spconfig, 0, sizeof(sp_session_config));
-	spconfig->api_version = SPOTIFY_API_VERSION;
-	spconfig->cache_location = al_path_cstr(spotify_stream->cache, ALLEGRO_NATIVE_PATH_SEP);
-	spconfig->settings_location = al_path_cstr(spotify_stream->cache, ALLEGRO_NATIVE_PATH_SEP);
-	spconfig->application_key = g_appkey;
-	spconfig->user_agent = "allegro";
-	spconfig->callbacks = &_session_callbacks;
-	spconfig->userdata = spotify_stream;
-	spconfig->application_key_size = g_appkey_size;
+	sp_session_config spconfig;
+	memset(&spconfig, 0, sizeof(sp_session_config));
+	spconfig.api_version = SPOTIFY_API_VERSION;
+	spconfig.cache_location = al_path_cstr(spotify_stream->cache, ALLEGRO_NATIVE_PATH_SEP);
+	spconfig.settings_location = al_path_cstr(spotify_stream->cache, ALLEGRO_NATIVE_PATH_SEP);
+	spconfig.application_key = g_appkey;
+	spconfig.user_agent = "allegro";
+	spconfig.callbacks = &_session_callbacks;
+	spconfig.userdata = spotify_stream;
+	spconfig.application_key_size = g_appkey_size;
 
 	// Attempt to create the session.
-	if ((error = sp_session_create(spconfig, &spotify_stream->session)) != SP_ERROR_OK) {
+	if ((error = sp_session_create(&spconfig, &spotify_stream->session)) != SP_ERROR_OK) {
 		fprintf(stderr, "unable to create session: %s\n", sp_error_message(error));
 		return NULL;
 	}
@@ -291,61 +289,3 @@ void al_play_song(ALLEGRO_SPOTIFY_STREAM *spotify_stream, char *artist, char *tr
 	sp_search_create(spotify_stream->session, q, 0, 1, 0, 0, 0, 0, 0, 0, SP_SEARCH_STANDARD, &_on_search_complete, spotify_stream);
 }
 
-/* -- Example -- */
-
-// Initialize Allegro.
-void init_allegro()
-{
-	if (!al_init()) {
-		fprintf(stderr, "failed to start allegro!\n");
-		exit(1);
-	}
-
-	if (!al_install_audio()) {
-		fprintf(stderr, "failed to install audio subsystem!\n");
-		exit(1);
-	}
-
-	if (!al_reserve_samples(1)) {
-		fprintf(stderr, "failed to reserve an audio sample!\n");
-		exit(1);
-	}
-}
-
-int main(void)
-{
-	init_allegro();
-
-	ALLEGRO_EVENT_QUEUE *event_queue = al_create_event_queue();
-
-	ALLEGRO_SPOTIFY_STREAM *spotify_stream = al_new_spotify_stream(event_queue);
-	if (spotify_stream == NULL) {
-		return 2;
-	}
-
-	ALLEGRO_EVENT event;
-
-	// main loop
-	while (1) {
-		al_wait_for_event(event_queue, &event);
-		switch (event.type) {
-			case ALLEGRO_EVENT_SPOTIFY_NOTIFY_MAIN_THREAD:
-				// process Spotify events
-				al_spotify_stream_process_events(spotify_stream);
-				break;
-			case ALLEGRO_EVENT_SPOTIFY_LOGIN:
-				if (event.user.data2 == SP_ERROR_OK) {
-					printf("logged in, playing song.\n");
-					al_play_song(spotify_stream, "The Neighbourhood", "Afraid");
-				} else {
-					fprintf(stderr, "failed to log in: %s\n", sp_error_message(event.user.data2));
-				}
-				break;
-			default:
-				debug("received unknown event id: %d", event.type);
-				break;
-		}
-	}
-
-	return 0;
-}
